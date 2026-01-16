@@ -1,0 +1,179 @@
+import socket
+import threading
+import json
+import time
+from flask import Flask, render_template_string
+
+# --- CONFIGURAÇÕES GERAIS / GENERAL SETTINGS ---
+# Altere para a pool de sua preferência
+POOL_HOST = "br.stratum.slushpool.com" 
+POOL_PORT = 3333
+LOCAL_PROXY_PORT = 4444
+DASHBOARD_PORT = 5000
+
+# --- ESTIMATIVA FINANCEIRA / FINANCIAL ESTIMATION ---
+# Valor estimado que a pool paga por share enviado
+VALOR_POR_SHARE = 0.00000005 
+MOEDA_SIMBOLO = "BTC"
+
+# --- ESTADO GLOBAL / GLOBAL STATE ---
+stats = {
+    "total_shares": 0,
+    "start_time": time.time(),
+    "lucro_estimado": 0.0,
+    "nodes": {} # Estrutura: { "IP": {"shares": 0, "is_sustainable": True} }
+}
+
+app = Flask(__name__)
+
+@app.route('/')
+def dashboard():
+    uptime = round((time.time() - stats["start_time"]) / 3600, 2)
+    # Ordena os nós para que os sustentáveis apareçam no topo
+    sorted_nodes = dict(sorted(stats["nodes"].items(), key=lambda x: x[1]['is_sustainable'], reverse=True))
+    
+    html = """
+    <html>
+        <head>
+            <title>EcoMining Brasil - Central de Comando</title>
+            <meta http-equiv="refresh" content="10">
+            <style>
+                body { font-family: 'Segoe UI', sans-serif; background: #0b0e14; color: #e1e1e1; padding: 20px; }
+                .container { max-width: 1100px; margin: auto; }
+                .header { border-bottom: 2px solid #00c853; padding-bottom: 15px; margin-bottom: 25px; display: flex; justify-content: space-between; align-items: center; }
+                .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; }
+                .card { background: #161b22; border-radius: 10px; padding: 20px; border: 1px solid #30363d; }
+                .val { font-size: 1.8em; font-weight: bold; color: #00c853; }
+                .val-gold { color: #ffd600; }
+                .miner-table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+                .miner-table th, .miner-table td { padding: 12px; text-align: left; border-bottom: 1px solid #30363d; }
+                .tag { padding: 4px 8px; border-radius: 4px; font-size: 0.75em; font-weight: bold; }
+                .tag-green { background: #1b5e20; color: #a5d6a7; }
+                .tag-gray { background: #333; color: #ccc; }
+                .row-highlight { background: #1a231b; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>EcoMining Brasil: Gestão de Equipe Verde</h1>
+                    <span>Uptime do Sistema: <b>{{ uptime }}h</b></span>
+                </div>
+
+                <div class="grid">
+                    <div class="card">
+                        <h2>Trabalho Total</h2>
+                        <div class="val">{{ total_shares }} Shares</div>
+                        <p>Contribuições validadas pela equipe</p>
+                    </div>
+                    <div class="card">
+                        <h2>Ganhos Estimados</h2>
+                        <div class="val val-gold">{{ "%.8f"|format(lucro_estimado) }} {{ symbol }}</div>
+                        <p>Baseado no volume de trabalho atual</p>
+                    </div>
+                    <div class="card">
+                        <h2>Nós Ativos</h2>
+                        <div class="val">{{ miners_count }} Locais</div>
+                        <p>Residências conectadas ao projeto</p>
+                    </div>
+                </div>
+
+                <div class="card" style="margin-top: 20px;">
+                    <h2>Monitoramento de Unidades (Prioridade Sustentável)</h2>
+                    <table class="miner-table">
+                        <thead>
+                            <tr>
+                                <th>Unidade / IP</th>
+                                <th>Eficiência Acumulada</th>
+                                <th>Fonte Energética</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for ip, data in nodes.items() %}
+                            <tr class="{{ 'row-highlight' if data.is_sustainable else '' }}">
+                                <td>{{ ip }}</td>
+                                <td>{{ data.shares }} shares</td>
+                                <td>
+                                    {% if data.is_sustainable %}
+                                        <span class="tag tag-green">SOLAR / RENOVÁVEL</span>
+                                    {% else %}
+                                        <span class="tag tag-gray">CONVENCIONAL</span>
+                                    {% endif %}
+                                </td>
+                                <td style="color: #00c853;">● OPERAÇÃO NORMAL</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </body>
+    </html>
+    """
+    return render_template_string(html, 
+                                  miners_count=len(stats["nodes"]), 
+                                  total_shares=stats["total_shares"], 
+                                  lucro_estimado=stats["lucro_estimado"],
+                                  nodes=sorted_nodes,
+                                  uptime=uptime,
+                                  symbol=MOEDA_SIMBOLO)
+
+class UniversalMiningProxy:
+    def __init__(self, local_port=LOCAL_PROXY_PORT):
+        self.local_port = local_port
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server.bind(('0.0.0.0', self.local_port))
+        self.server.listen(200)
+
+    def handle_connection(self, client_socket, address):
+        ip_source = address[0]
+        
+        if ip_source not in stats["nodes"]:
+            # Inicializa novo nó com preferência sustentável
+            stats["nodes"][ip_source] = {"shares": 0, "is_sustainable": True}
+
+        try:
+            pool_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            pool_socket.connect((POOL_HOST, POOL_PORT))
+
+            def forward(source, destination, is_upstream):
+                try:
+                    while True:
+                        data = source.recv(8192)
+                        if not data: break
+                        
+                        # Monitora submissão de shares no protocolo Stratum
+                        if is_upstream and b"mining.submit" in data:
+                            stats["total_shares"] += 1
+                            stats["lucro_estimado"] += VALOR_POR_SHARE
+                            stats["nodes"][ip_source]["shares"] += 1
+                        
+                        destination.sendall(data)
+                except:
+                    pass
+                finally:
+                    source.close()
+                    destination.close()
+
+            threading.Thread(target=forward, args=(client_socket, pool_socket, True), daemon=True).start()
+            threading.Thread(target=forward, args=(pool_socket, client_socket, False), daemon=True).start()
+
+        except Exception as e:
+            print(f"[!] Erro de rede com {ip_source}: {e}")
+
+    def start(self):
+        print(f"[*] Proxy EcoMining iniciado na porta {self.local_port}")
+        while True:
+            client, addr = self.server.accept()
+            threading.Thread(target=self.handle_connection, args=(client, addr), daemon=True).start()
+
+if __name__ == "__main__":
+    # Inicia o motor do Proxy
+    proxy_engine = UniversalMiningProxy()
+    threading.Thread(target=proxy_engine.start, daemon=True).start()
+    
+    # Inicia o Dashboard Web
+    print(f"[*] Dashboard disponível em: http://0.0.0.0:{DASHBOARD_PORT}")
+    app.run(host='0.0.0.0', port=DASHBOARD_PORT, debug=False, use_reloader=False)
